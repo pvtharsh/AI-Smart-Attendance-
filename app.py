@@ -3,10 +3,12 @@ import sqlite3
 import pandas as pd
 import plotly.graph_objects as go
 import cv2
-import face_recognition
+import mediapipe as mp
 import numpy as np
 from datetime import datetime
 import time
+import os
+import pickle
 
 st.set_page_config(page_title="NeuroAttend", page_icon="🧠", layout="wide", initial_sidebar_state="expanded")
 
@@ -50,8 +52,6 @@ section[data-testid="stSidebar"] .stRadio div[role="radiogroup"] label:hover{bac
 .neon-content-card{background:rgba(13,18,30,.7);border:1px solid #1f2940;border-radius:16px;padding:24px;margin-bottom:22px;transition:border-color .25s,box-shadow .25s;}
 .neon-content-card:hover{border-color:#00e5ff60;box-shadow:0 0 25px rgba(0,229,255,.1);}
 .neon-card-heading{font-family:'Orbitron',sans-serif;font-size:16px;font-weight:700;color:#00e5ff;margin-bottom:18px;letter-spacing:1px;text-shadow:0 0 8px rgba(0,229,255,.4);}
-
-/* ── NEW ATTENDANCE % BAR CHART ── */
 .att-bar-row{display:flex;align-items:center;gap:12px;margin-bottom:14px;}
 .att-avatar{width:40px;height:40px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;flex-shrink:0;font-family:'Orbitron',sans-serif;}
 .att-info{flex:1;}
@@ -60,8 +60,6 @@ section[data-testid="stSidebar"] .stRadio div[role="radiogroup"] label:hover{bac
 .att-fill{height:100%;border-radius:6px;position:relative;transition:width 1.4s cubic-bezier(.4,0,.2,1);}
 .att-fill::after{content:'';position:absolute;top:2px;left:10px;width:28%;height:3px;background:rgba(255,255,255,.32);border-radius:2px;}
 .att-pct{font-size:12px;font-family:'Orbitron',sans-serif;min-width:38px;text-align:right;font-weight:700;}
-
-/* ── NEW ENGAGEMENT DONUT ── */
 .eng-wrap{display:flex;gap:20px;align-items:center;}
 .eng-legend{flex:1;display:flex;flex-direction:column;gap:12px;}
 .eng-row{display:flex;align-items:center;gap:10px;}
@@ -71,7 +69,6 @@ section[data-testid="stSidebar"] .stRadio div[role="radiogroup"] label:hover{bac
 .eng-label{font-size:10px;color:#8b96b3;letter-spacing:1.5px;}
 .eng-val{font-size:13px;font-weight:700;font-family:'Orbitron',sans-serif;}
 .eng-mini-bar{height:4px;border-radius:2px;}
-
 .stButton button{width:100%;border-radius:12px;background:transparent;color:#00e5ff;font-weight:700;font-size:16px;border:2px solid #00e5ff;padding:14px;transition:all .25s;box-shadow:0 0 14px rgba(0,229,255,.2);font-family:'Orbitron',sans-serif;letter-spacing:1px;}
 .stButton button:hover{background:rgba(0,229,255,.1);box-shadow:0 0 30px rgba(0,229,255,.5);transform:translateY(-2px);color:#fff;}
 .stTextInput input{background-color:rgba(10,14,23,.8);color:#fff;border-radius:10px;border:1px solid #1f2940;padding:12px;font-size:15px;}
@@ -83,9 +80,30 @@ h1,h2,h3{color:#fff;}p,label,span{color:#8b96b3;}
 </style>
 """, unsafe_allow_html=True)
 
+# ── MEDIAPIPE SETUP ──────────────────────────────────────────────────────────
+mp_face_detection = mp.solutions.face_detection
+mp_face_mesh      = mp.solutions.face_mesh
+mp_drawing        = mp.solutions.drawing_utils
+
+# Eye landmark indices for mediapipe face mesh (left & right eye)
+LEFT_EYE_IDXS  = [362, 385, 387, 263, 373, 380]
+RIGHT_EYE_IDXS = [33,  160, 158, 133, 153, 144]
+
+# ── DB HELPERS ───────────────────────────────────────────────────────────────
+os.makedirs("data", exist_ok=True)
+os.makedirs("student_photos", exist_ok=True)
 
 def get_connection():
-    return sqlite3.connect('data/attendai.db')
+    conn = sqlite3.connect('data/attendai.db')
+    conn.execute('''CREATE TABLE IF NOT EXISTS students
+        (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, roll_no TEXT UNIQUE,
+         encoding BLOB, photo_path TEXT, registered_on TEXT DEFAULT CURRENT_TIMESTAMP)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS attendance
+        (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id INTEGER, date TEXT, time TEXT, status TEXT)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS engagement_logs
+        (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, time TEXT, status TEXT)''')
+    conn.commit()
+    return conn
 
 def get_students_df():
     conn = get_connection()
@@ -108,19 +126,9 @@ def get_engagement_df():
         df = pd.DataFrame(columns=["date","time","status"])
     conn.close(); return df
 
-def load_known_faces():
-    conn = get_connection(); cursor = conn.cursor()
-    cursor.execute("SELECT id, name, roll_no, encoding FROM students")
-    students = cursor.fetchall(); conn.close()
-    known_encodings, known_ids, known_names, known_rolls = [], [], [], []
-    for sid, name, roll_no, blob in students:
-        known_encodings.append(np.frombuffer(blob, dtype=np.float64))
-        known_ids.append(sid); known_names.append(name); known_rolls.append(roll_no)
-    return known_encodings, known_ids, known_names, known_rolls
-
 def mark_attendance_db(student_id):
     conn = get_connection(); cursor = conn.cursor()
-    today = datetime.now().strftime('%Y-%m-%d')
+    today    = datetime.now().strftime('%Y-%m-%d')
     now_time = datetime.now().strftime('%H:%M:%S')
     cursor.execute('SELECT * FROM attendance WHERE student_id=? AND date=?', (student_id, today))
     if cursor.fetchone(): conn.close(); return False
@@ -128,6 +136,69 @@ def mark_attendance_db(student_id):
                    (student_id, today, now_time, 'Present'))
     conn.commit(); conn.close(); return True
 
+# ── FACE EMBEDDING HELPERS (mediapipe mesh → 128-d landmark vector) ──────────
+def _lm_to_vec(face_landmarks, img_w, img_h):
+    """Flatten all 468 normalised landmarks to a 1404-d float32 vector,
+    then L2-normalise — used as a lightweight face descriptor."""
+    pts = np.array([[lm.x, lm.y, lm.z] for lm in face_landmarks.landmark], dtype=np.float32)
+    # Align: subtract nose-tip (landmark 1) so position-invariant
+    pts -= pts[1]
+    vec = pts.flatten()
+    norm = np.linalg.norm(vec)
+    return vec / norm if norm > 0 else vec
+
+def get_face_encoding_from_frame(frame_bgr):
+    """Return (encoding_vector, face_bbox) or (None, None) if no single face found."""
+    h, w = frame_bgr.shape[:2]
+    rgb   = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1,
+                                refine_landmarks=True, min_detection_confidence=0.5) as fm:
+        result = fm.process(rgb)
+    if not result.multi_face_landmarks:
+        return None, None
+    lms  = result.multi_face_landmarks[0]
+    enc  = _lm_to_vec(lms, w, h)
+    # Bounding box from landmark extremes
+    xs = [lm.x * w for lm in lms.landmark]
+    ys = [lm.y * h for lm in lms.landmark]
+    bbox = (int(min(ys)), int(max(xs)), int(max(ys)), int(min(xs)))  # top,right,bottom,left
+    return enc, bbox
+
+def compare_encodings(known_encs, candidate_enc, threshold=0.18):
+    """Cosine-distance based comparison. Returns (best_idx, distance)."""
+    dists = [1 - float(np.dot(k, candidate_enc)) for k in known_encs]
+    if not dists:
+        return -1, 1.0
+    best_idx = int(np.argmin(dists))
+    return best_idx, dists[best_idx]
+
+def load_known_faces():
+    conn = get_connection(); cursor = conn.cursor()
+    cursor.execute("SELECT id, name, roll_no, encoding FROM students")
+    rows = cursor.fetchall(); conn.close()
+    known_encs, known_ids, known_names, known_rolls = [], [], [], []
+    for sid, name, roll_no, blob in rows:
+        enc = np.frombuffer(blob, dtype=np.float32)
+        known_encs.append(enc); known_ids.append(sid)
+        known_names.append(name); known_rolls.append(roll_no)
+    return known_encs, known_ids, known_names, known_rolls
+
+# ── EAR (Eye Aspect Ratio) ────────────────────────────────────────────────────
+def _ear(pts):
+    A = np.linalg.norm(pts[1] - pts[5])
+    B = np.linalg.norm(pts[2] - pts[4])
+    C = np.linalg.norm(pts[0] - pts[3])
+    return (A + B) / (2.0 * C) if C > 0 else 0.3
+
+def calc_ear_from_mesh(face_landmarks, img_w, img_h):
+    def lm(idx):
+        l = face_landmarks.landmark[idx]
+        return np.array([l.x * img_w, l.y * img_h])
+    l_pts = np.array([lm(i) for i in LEFT_EYE_IDXS])
+    r_pts = np.array([lm(i) for i in RIGHT_EYE_IDXS])
+    return (_ear(l_pts) + _ear(r_pts)) / 2.0
+
+# ── UI HELPERS ────────────────────────────────────────────────────────────────
 def make_cylinder_card(color, icon, value, label, fill_pct):
     fill_pct = max(4, min(96, fill_pct))
     st.markdown(f"""
@@ -146,31 +217,26 @@ def make_cylinder_card(color, icon, value, label, fill_pct):
         <div class="cyl-label cyl-label-{color}">{label}</div>
     </div>""", unsafe_allow_html=True)
 
-
-COLORS = ['#00e5ff','#ff2e92','#a855f7','#00e596','#ffaa00','#ff6b6b','#7fffd4']
-COLOR_BG = ['rgba(0,229,255,.15)','rgba(255,46,146,.15)','rgba(168,85,247,.15)',
-            'rgba(0,229,150,.15)','rgba(255,170,0,.15)','rgba(255,107,107,.15)']
+COLORS       = ['#00e5ff','#ff2e92','#a855f7','#00e596','#ffaa00','#ff6b6b','#7fffd4']
+COLOR_BG     = ['rgba(0,229,255,.15)','rgba(255,46,146,.15)','rgba(168,85,247,.15)',
+                 'rgba(0,229,150,.15)','rgba(255,170,0,.15)','rgba(255,107,107,.15)']
 COLOR_BORDER = ['rgba(0,229,255,.4)','rgba(255,46,146,.4)','rgba(168,85,247,.4)',
-                'rgba(0,229,150,.4)','rgba(255,170,0,.4)','rgba(255,107,107,.4)']
+                 'rgba(0,229,150,.4)','rgba(255,170,0,.4)','rgba(255,107,107,.4)']
 GRADIENTS_FROM = ['#00b8cc','#cc1166','#7722cc','#00aa70','#cc8800','#cc3333']
-EMOJIS = ['😎','🌸','⚡','🌿','🔥','💫','✨']
 
 def render_attendance_bar_chart(attendance_df):
-    """Render the cool avatar + glowing bar attendance % chart."""
     if attendance_df.empty:
         st.info("No attendance data yet."); return
     counts = attendance_df['name'].value_counts().reset_index()
     counts.columns = ['Student', 'Days Present']
-    total_days = attendance_df['date'].nunique()
+    total_days = max(attendance_df['date'].nunique(), 1)
     counts['Percentage'] = (counts['Days Present'] / total_days * 100).round(0).astype(int)
-
     rows_html = ""
     for i, row in counts.iterrows():
         idx = i % len(COLORS)
         initial = row['Student'][0].upper()
         color = COLORS[idx]; bg = COLOR_BG[idx]; border = COLOR_BORDER[idx]
-        grad_from = GRADIENTS_FROM[idx]
-        pct = int(row['Percentage'])
+        grad_from = GRADIENTS_FROM[idx]; pct = int(row['Percentage'])
         rows_html += f"""
         <div class="att-bar-row">
             <div class="att-avatar" style="background:{bg};color:{color};border:2px solid {border};">{initial}</div>
@@ -184,12 +250,9 @@ def render_attendance_bar_chart(attendance_df):
         </div>"""
     st.markdown(rows_html, unsafe_allow_html=True)
 
-
 def render_engagement_donut(engagement_df):
-    """Render the glowing donut + mini-bar legend engagement chart."""
     if engagement_df.empty:
         st.info("No engagement data yet."); return
-
     sc = engagement_df['status'].value_counts()
     total = sc.sum()
     statuses = [
@@ -197,21 +260,14 @@ def render_engagement_donut(engagement_df):
         ('Drowsy',      '😴', '#ff2e92', 'rgba(255,46,146,.15)'),
         ('Eyes Closed', '😪', '#a855f7', 'rgba(168,85,247,.15)'),
     ]
-
-    circumference = 314.16  # 2*pi*50
-    offset = 78.5
-    segments_svg = ""
-    legend_html = ""
-    running_pct = 0
-
+    circumference = 314.16; offset = 78.5
+    segments_svg = ""; legend_html = ""
     for label, emoji, color, bg in statuses:
         count = sc.get(label, 0)
-        pct = round(count / total * 100) if total > 0 else 0
-        arc = circumference * pct / 100
-        gap = circumference - arc
-        dash = f"{arc:.1f} {gap:.1f}"
+        pct   = round(count / total * 100) if total > 0 else 0
+        arc   = circumference * pct / 100; gap = circumference - arc
         segments_svg += f"""<circle cx="65" cy="65" r="50" fill="none" stroke="{color}" stroke-width="22"
-            stroke-dasharray="{dash}" stroke-dashoffset="-{offset:.1f}" stroke-linecap="butt"
+            stroke-dasharray="{arc:.1f} {gap:.1f}" stroke-dashoffset="-{offset:.1f}" stroke-linecap="butt"
             style="transition:stroke-dasharray 1.5s ease;"/>"""
         offset += arc
         legend_html += f"""
@@ -225,31 +281,21 @@ def render_engagement_donut(engagement_df):
                 <div class="eng-mini-bar" style="width:{pct}%;background:{color};box-shadow:0 0 6px {color}88;"></div>
             </div>
         </div>"""
-        running_pct += pct
-
-    top_label = statuses[0][0] if sc.get('Attentive',0) >= sc.get('Drowsy',0) else statuses[1][0]
-    top_pct = round(sc.get('Attentive',0)/total*100) if total>0 else 0
-    donut_center_color = statuses[0][2]
-
+    top_pct = round(sc.get('Attentive', 0) / total * 100) if total > 0 else 0
     donut_svg = f"""
-    <svg width="140" height="140" viewBox="0 0 130 130" role="img" aria-label="Engagement breakdown donut chart">
+    <svg width="140" height="140" viewBox="0 0 130 130">
         <circle cx="65" cy="65" r="50" fill="none" stroke="#1a2035" stroke-width="22"/>
         {segments_svg}
         <circle cx="65" cy="65" r="38" fill="rgba(13,18,30,0.95)"/>
-        <text x="65" y="60" text-anchor="middle" fill="{donut_center_color}" font-size="20"
+        <text x="65" y="60" text-anchor="middle" fill="#00e5ff" font-size="20"
               font-family="Orbitron,sans-serif" font-weight="900">{top_pct}%</text>
         <text x="65" y="76" text-anchor="middle" fill="#6b7a99" font-size="8"
               font-family="Orbitron,sans-serif">FOCUS RATE</text>
     </svg>"""
+    st.markdown(f"""<div class="eng-wrap">{donut_svg}<div class="eng-legend">{legend_html}</div></div>""",
+                unsafe_allow_html=True)
 
-    st.markdown(f"""
-    <div class="eng-wrap">
-        {donut_svg}
-        <div class="eng-legend">{legend_html}</div>
-    </div>""", unsafe_allow_html=True)
-
-
-# ── SIDEBAR ──────────────────────────────────────────────────────────────────
+# ── SIDEBAR ───────────────────────────────────────────────────────────────────
 st.sidebar.markdown("""
 <div style="text-align:center;padding:28px 0;">
     <div style="font-size:40px;text-shadow:0 0 20px rgba(0,229,255,.6);">🧠</div>
@@ -264,8 +310,7 @@ page = st.sidebar.radio("",
      "⬡  Attendance Records","⬡  Analytics"])
 st.sidebar.markdown("<br><br>", unsafe_allow_html=True)
 st.sidebar.markdown("""<div style="font-size:11px;color:#3d4863;text-align:center;letter-spacing:1px;">
-PYTHON · OPENCV · FACE_RECOGNITION<br>MEDIAPIPE · DEEPFACE · STREAMLIT</div>""", unsafe_allow_html=True)
-
+PYTHON · OPENCV · MEDIAPIPE<br>STREAMLIT · PLOTLY · SQLITE</div>""", unsafe_allow_html=True)
 
 # ── DASHBOARD ─────────────────────────────────────────────────────────────────
 if page == "⬡  Dashboard":
@@ -285,7 +330,6 @@ if page == "⬡  Dashboard":
     with col1: make_cylinder_card("cyan",    "👥", total_s,       "Total Students", int(total_s/max_cap*90))
     with col2: make_cylinder_card("magenta", "✓",  present_s,     "Present Today",  int(present_s/total_s*90) if total_s else 0)
     with col3: make_cylinder_card("purple",  "◉",  attentive_cnt, "Attentive Logs", int(attentive_cnt/max(attentive_cnt,10)*90))
-
     st.markdown("<br>", unsafe_allow_html=True)
 
     col_a, col_b = st.columns(2)
@@ -332,128 +376,168 @@ if page == "⬡  Dashboard":
 elif page == "⬡  Register Student":
     st.markdown('<div class="neon-tag">⬡ SETUP</div>', unsafe_allow_html=True)
     st.markdown('<div class="neon-title">Register Student</div>', unsafe_allow_html=True)
-    st.markdown('<div class="neon-subtitle">Capture a face and add them to the system</div>', unsafe_allow_html=True)
+    st.markdown('<div class="neon-subtitle">Upload a photo or use webcam to register a student</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="neon-content-card">', unsafe_allow_html=True)
+    st.markdown('<div class="neon-card-heading">⬡ STUDENT DETAILS</div>', unsafe_allow_html=True)
+
     with st.form("register_form"):
-        name    = st.text_input("Student Name")
-        roll_no = st.text_input("Roll Number")
-        submit  = st.form_submit_button("◉  OPEN CAMERA & REGISTER")
+        name     = st.text_input("Student Name")
+        roll_no  = st.text_input("Roll Number")
+        uploaded = st.file_uploader("Upload Student Photo (JPG/PNG)", type=["jpg","jpeg","png"])
+        submit   = st.form_submit_button("◉  REGISTER STUDENT")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── WEBCAM fallback ──
+    st.markdown('<div class="neon-content-card">', unsafe_allow_html=True)
+    st.markdown('<div class="neon-card-heading">⬡ OR USE WEBCAM SNAPSHOT</div>', unsafe_allow_html=True)
+    cam_img = st.camera_input("Take a photo")
     st.markdown('</div>', unsafe_allow_html=True)
 
     if submit:
         if not name or not roll_no:
             st.error("Please enter both Name and Roll Number!")
         else:
-            st.info("Camera window will open. Press 'S' to capture, 'Q' to cancel.")
-            cap = cv2.VideoCapture(0); captured_frame = None
-            while True:
-                ret, frame = cap.read()
-                if not ret: break
-                frame = cv2.flip(frame, 1)
-                cv2.putText(frame,"Press 'S' to Capture | 'Q' to Quit",(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2)
-                cv2.putText(frame,f"Student: {name} | Roll: {roll_no}",(10,60),cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,0),2)
-                cv2.imshow("NeuroAttend - Register Student", frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('s'): captured_frame = frame.copy(); break
-                elif key == ord('q'): break
-            cap.release(); cv2.destroyAllWindows()
-            if captured_frame is None:
-                st.warning("Registration cancelled.")
+            img_source = uploaded if uploaded is not None else cam_img
+            if img_source is None:
+                st.error("Please upload a photo or take a webcam snapshot!")
             else:
-                rgb = np.ascontiguousarray(cv2.cvtColor(captured_frame, cv2.COLOR_BGR2RGB))
-                locs = face_recognition.face_locations(rgb)
-                if len(locs)==0: st.error("No face detected!")
-                elif len(locs)>1: st.error("Multiple faces detected!")
+                import io
+                from PIL import Image
+                pil_img   = Image.open(io.BytesIO(img_source.read())).convert("RGB")
+                frame_rgb = np.array(pil_img)
+                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+                enc, bbox = get_face_encoding_from_frame(frame_bgr)
+                if enc is None:
+                    st.error("❌ No face detected in the image! Please try again with a clearer photo.")
                 else:
-                    enc = face_recognition.face_encodings(rgb, locs)[0]
                     photo_path = f"student_photos/{roll_no}_{name}.jpg"
-                    cv2.imwrite(photo_path, captured_frame)
+                    cv2.imwrite(photo_path, frame_bgr)
                     try:
-                        conn = get_connection(); cursor = conn.cursor()
+                        conn   = get_connection(); cursor = conn.cursor()
                         cursor.execute('INSERT INTO students (name,roll_no,encoding,photo_path) VALUES (?,?,?,?)',
                                        (name, roll_no, enc.tobytes(), photo_path))
                         conn.commit(); conn.close()
-                        st.success(f"✅ {name} (Roll No: {roll_no}) registered!")
-                        st.image(cv2.cvtColor(captured_frame, cv2.COLOR_BGR2RGB), caption="Captured Photo", width=300)
+                        st.success(f"✅ {name} (Roll No: {roll_no}) registered successfully!")
+                        # Draw box on preview
+                        preview = frame_rgb.copy()
+                        if bbox:
+                            top, right, bottom, left = bbox
+                            cv2.rectangle(preview, (left, top), (right, bottom), (0, 229, 255), 3)
+                        st.image(preview, caption=f"Registered: {name}", width=320)
                     except sqlite3.IntegrityError:
-                        st.error(f"Roll No {roll_no} already registered!")
+                        st.error(f"Roll No {roll_no} is already registered!")
 
 
 # ── MARK ATTENDANCE ───────────────────────────────────────────────────────────
 elif page == "⬡  Mark Attendance":
     st.markdown('<div class="neon-tag">⬡ LIVE SESSION</div>', unsafe_allow_html=True)
     st.markdown('<div class="neon-title">Mark Attendance</div>', unsafe_allow_html=True)
-    st.markdown('<div class="neon-subtitle">Live face recognition with blink-based liveness check</div>', unsafe_allow_html=True)
+    st.markdown('<div class="neon-subtitle">Upload a class photo or use webcam — faces are matched automatically</div>', unsafe_allow_html=True)
 
-    EAR_THRESHOLD = 0.21; BLINK_CHECK_DURATION = 5.0
+    EAR_THRESHOLD = 0.21
 
-    def ear_dist(p1,p2): return np.linalg.norm(np.array(p1)-np.array(p2))
-    def calc_ear(pts):
-        return (ear_dist(pts[1],pts[5])+ear_dist(pts[2],pts[4]))/(2.0*ear_dist(pts[0],pts[3]))
+    known_encodings, known_ids, known_names, known_rolls = load_known_faces()
 
-    st.markdown('<div class="neon-content-card">', unsafe_allow_html=True)
-    start = st.button("▶  START ATTENDANCE CAMERA")
-    st.markdown('</div>', unsafe_allow_html=True)
+    if not known_encodings:
+        st.warning("⚠️ No students registered yet. Please register students first.")
+    else:
+        st.markdown('<div class="neon-content-card">', unsafe_allow_html=True)
+        st.markdown('<div class="neon-card-heading">⬡ CAPTURE METHOD</div>', unsafe_allow_html=True)
+        method = st.radio("", ["📷 Webcam Snapshot", "🖼️ Upload Photo"], horizontal=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    if start:
-        known_encodings, known_ids, known_names, known_rolls = load_known_faces()
-        if not known_encodings:
-            st.error("No students registered yet!")
+        frame_rgb = None
+
+        if method == "📷 Webcam Snapshot":
+            st.markdown('<div class="neon-content-card">', unsafe_allow_html=True)
+            cam_img = st.camera_input("Take attendance photo")
+            st.markdown('</div>', unsafe_allow_html=True)
+            if cam_img:
+                import io
+                from PIL import Image
+                pil_img   = Image.open(io.BytesIO(cam_img.read())).convert("RGB")
+                frame_rgb = np.array(pil_img)
         else:
-            st.info("Camera opening... Press 'Q' to stop.")
-            cap = cv2.VideoCapture(0)
-            blink_start, eyes_closed, blink_det, marked_today = {},{},{},set()
-            marked_names = []
-            while True:
-                ret, frame = cap.read()
-                if not ret: break
-                frame = cv2.flip(frame, 1)
-                rgb = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                locs = face_recognition.face_locations(rgb)
-                encs = face_recognition.face_encodings(rgb, locs)
-                lmarks = face_recognition.face_landmarks(rgb, locs)
-                for (top,right,bottom,left),fe,lm in zip(locs,encs,lmarks):
-                    matches = face_recognition.compare_faces(known_encodings, fe, tolerance=0.5)
-                    dists   = face_recognition.face_distance(known_encodings, fe)
-                    name="Unknown"; color=(0,0,255); status_text=""
-                    avg_ear=None
-                    if 'left_eye' in lm and 'right_eye' in lm:
-                        avg_ear=(calc_ear(lm['left_eye'])+calc_ear(lm['right_eye']))/2.0
-                    if len(dists):
-                        bmi=np.argmin(dists)
-                        if matches[bmi]:
-                            sid=known_ids[bmi]; name=known_names[bmi]; roll=known_rolls[bmi]
-                            if sid in marked_today:
-                                color=(0,255,0); status_text="Already Marked"
-                            else:
-                                if sid not in blink_start:
-                                    blink_start[sid]=time.time(); eyes_closed[sid]=False; blink_det[sid]=False
-                                elapsed=time.time()-blink_start[sid]
-                                if avg_ear is not None:
-                                    if avg_ear<EAR_THRESHOLD: eyes_closed[sid]=True
-                                    else:
-                                        if eyes_closed[sid]: blink_det[sid]=True
-                                        eyes_closed[sid]=False
-                                if blink_det[sid]:
-                                    color=(0,255,0); status_text="LIVE - Marking..."
-                                    if mark_attendance_db(sid): marked_names.append(f"{name} ({roll})")
-                                    marked_today.add(sid)
-                                elif elapsed>BLINK_CHECK_DURATION:
-                                    color=(0,0,255); status_text="SPOOF? No blink"
-                                else:
-                                    color=(0,165,255); status_text=f"Checking... {int(BLINK_CHECK_DURATION-elapsed)}s"
-                    cv2.rectangle(frame,(left,top),(right,bottom),color,2)
-                    cv2.putText(frame,name,(left,top-30),cv2.FONT_HERSHEY_SIMPLEX,0.8,color,2)
-                    cv2.putText(frame,status_text,(left,top-5),cv2.FONT_HERSHEY_SIMPLEX,0.6,color,2)
-                cv2.imshow("NeuroAttend - Mark Attendance", frame)
-                if cv2.waitKey(1)&0xFF==ord('q'): break
-            cap.release(); cv2.destroyAllWindows()
-            if marked_names:
-                st.success("✅ Attendance marked for:")
-                for n in marked_names: st.write(f"- {n}")
+            st.markdown('<div class="neon-content-card">', unsafe_allow_html=True)
+            up = st.file_uploader("Upload class photo", type=["jpg","jpeg","png"])
+            st.markdown('</div>', unsafe_allow_html=True)
+            if up:
+                import io
+                from PIL import Image
+                pil_img   = Image.open(io.BytesIO(up.read())).convert("RGB")
+                frame_rgb = np.array(pil_img)
+
+        if frame_rgb is not None:
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            h, w = frame_bgr.shape[:2]
+
+            # Detect all faces in image using face_detection
+            with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as fd:
+                res = fd.process(frame_rgb)
+
+            marked_names  = []
+            already_names = []
+            unknown_count = 0
+            annotated     = frame_rgb.copy()
+
+            if not res.detections:
+                st.warning("No faces detected in the image.")
             else:
-                st.info("No new attendance marked.")
+                with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=len(res.detections)+2,
+                                           refine_landmarks=True, min_detection_confidence=0.4) as fm:
+                    mesh_res = fm.process(frame_rgb)
+
+                mesh_landmarks = mesh_res.multi_face_landmarks if mesh_res.multi_face_landmarks else []
+
+                for lms in mesh_landmarks:
+                    enc = _lm_to_vec(lms, w, h)
+                    best_idx, dist = compare_encodings(known_encodings, enc, threshold=0.18)
+
+                    # Bounding box
+                    xs = [lm.x * w for lm in lms.landmark]
+                    ys = [lm.y * h for lm in lms.landmark]
+                    left, top     = int(min(xs)), int(min(ys))
+                    right, bottom = int(max(xs)), int(max(ys))
+                    pad = 10
+                    left, top     = max(0, left-pad), max(0, top-pad)
+                    right, bottom = min(w, right+pad), min(h, bottom+pad)
+
+                    if best_idx >= 0 and dist < 0.18:
+                        sid   = known_ids[best_idx]
+                        sname = known_names[best_idx]
+                        sroll = known_rolls[best_idx]
+                        success = mark_attendance_db(sid)
+                        if success:
+                            marked_names.append(f"{sname} ({sroll})")
+                            color_cv = (0, 229, 100)
+                            label    = f"{sname} ✓"
+                        else:
+                            already_names.append(f"{sname} ({sroll})")
+                            color_cv = (0, 180, 255)
+                            label    = f"{sname} (already)"
+                    else:
+                        unknown_count += 1
+                        color_cv = (0, 0, 220)
+                        label    = "Unknown"
+
+                    cv2.rectangle(annotated, (left, top), (right, bottom), color_cv, 3)
+                    cv2.putText(annotated, label, (left, max(top-8, 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_cv, 2)
+
+                st.image(annotated, caption="Attendance Result", use_container_width=True)
+
+                if marked_names:
+                    st.success(f"✅ Attendance marked for {len(marked_names)} student(s):")
+                    for n in marked_names: st.write(f"  • {n}")
+                if already_names:
+                    st.info(f"ℹ️ Already marked today:")
+                    for n in already_names: st.write(f"  • {n}")
+                if unknown_count:
+                    st.warning(f"⚠️ {unknown_count} unrecognised face(s) in the photo.")
+                if not marked_names and not already_names:
+                    st.error("No registered students found in this photo.")
 
 
 # ── ATTENDANCE RECORDS ────────────────────────────────────────────────────────
@@ -475,7 +559,7 @@ elif page == "⬡  Attendance Records":
         st.markdown('<div class="neon-content-card">', unsafe_allow_html=True)
         st.markdown('<div class="neon-card-heading">⬡ FILTER BY DATE</div>', unsafe_allow_html=True)
         dates = sorted(attendance_df['date'].unique(), reverse=True)
-        sel = st.selectbox("", dates)
+        sel   = st.selectbox("Select Date", dates)
         st.dataframe(attendance_df[attendance_df['date']==sel], use_container_width=True, hide_index=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -498,17 +582,14 @@ elif page == "⬡  Analytics":
     with c1: make_cylinder_card("cyan",    "👥", total_s,       "Total Students", int(total_s/max_cap*90))
     with c2: make_cylinder_card("magenta", "✓",  present_s,     "Present Today",  int(present_s/total_s*90) if total_s else 0)
     with c3: make_cylinder_card("purple",  "◉",  attentive_cnt, "Attentive Logs", int(attentive_cnt/max(attentive_cnt,10)*90))
-
     st.markdown("<br>", unsafe_allow_html=True)
 
     col1, col2 = st.columns(2)
-
     with col1:
         st.markdown('<div class="neon-content-card">', unsafe_allow_html=True)
         st.markdown('<div class="neon-card-heading">⬡ ATTENDANCE %</div>', unsafe_allow_html=True)
         render_attendance_bar_chart(attendance_df)
         st.markdown('</div>', unsafe_allow_html=True)
-
     with col2:
         st.markdown('<div class="neon-content-card">', unsafe_allow_html=True)
         st.markdown('<div class="neon-card-heading">⬡ ENGAGEMENT BREAKDOWN</div>', unsafe_allow_html=True)
@@ -518,7 +599,7 @@ elif page == "⬡  Analytics":
     st.markdown('<div class="neon-content-card">', unsafe_allow_html=True)
     st.markdown('<div class="neon-card-heading">⬡ ATTENDANCE TREND</div>', unsafe_allow_html=True)
     if not attendance_df.empty:
-        dc = attendance_df.groupby('date').size().reset_index(name='Present Count')
+        dc   = attendance_df.groupby('date').size().reset_index(name='Present Count')
         fig3 = go.Figure()
         fig3.add_trace(go.Scatter(x=dc['date'], y=dc['Present Count'], mode='lines+markers',
             line=dict(color='#a855f7', width=4, shape='spline', smoothing=1.3),
