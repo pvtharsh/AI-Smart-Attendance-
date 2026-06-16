@@ -444,13 +444,13 @@ elif page == "⬡  Register Student":
 
 
 # ── MARK ATTENDANCE ───────────────────────────────────────────────────────────
+# ── MARK ATTENDANCE ───────────────────────────────────────────────────────────
 elif page == "⬡  Mark Attendance":
     st.markdown('<div class="neon-tag">⬡ LIVE SESSION</div>', unsafe_allow_html=True)
     st.markdown('<div class="neon-title">Mark Attendance</div>', unsafe_allow_html=True)
     st.markdown('<div class="neon-subtitle">Upload a class photo or use webcam — faces are matched automatically</div>', unsafe_allow_html=True)
 
     EAR_THRESHOLD = 0.21
-
     known_encodings, known_ids, known_names, known_rolls = load_known_faces()
 
     if not known_encodings:
@@ -492,13 +492,18 @@ elif page == "⬡  Mark Attendance":
             marked_names  = []
             already_names = []
             unknown_count = 0
-            annotated     = cv2.cvtColor(frame_rgb.copy(), cv2.COLOR_RGB2BGR)
+
+            # RGB mein seedha copy — no BGR conversion needed
+            annotated = frame_rgb.copy()
 
             if not res.detections:
                 st.warning("No faces detected in the image.")
+                st.image(annotated, caption="No faces found", use_container_width=True)
             else:
-                with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=len(res.detections)+2,
-                                           refine_landmarks=True, min_detection_confidence=0.4) as fm:
+                with mp_face_mesh.FaceMesh(static_image_mode=True,
+                                           max_num_faces=len(res.detections)+2,
+                                           refine_landmarks=True,
+                                           min_detection_confidence=0.4) as fm:
                     mesh_res = fm.process(frame_rgb)
 
                 mesh_landmarks = mesh_res.multi_face_landmarks if mesh_res.multi_face_landmarks else []
@@ -512,7 +517,7 @@ elif page == "⬡  Mark Attendance":
                     left, top     = int(min(xs)), int(min(ys))
                     right, bottom = int(max(xs)), int(max(ys))
                     pad = 10
-                    left, top     = max(0, left-pad), max(0, top-pad)
+                    left, top     = max(0, left-pad),  max(0, top-pad)
                     right, bottom = min(w, right+pad), min(h, bottom+pad)
 
                     if best_idx >= 0 and dist < 0.18:
@@ -522,34 +527,29 @@ elif page == "⬡  Mark Attendance":
                         success = mark_attendance_db(sid)
                         if success:
                             marked_names.append(f"{sname} ({sroll})")
-                            color_cv = (0, 229, 100)
-                            label    = f"{sname} ✓"
+                            color_cv = (0, 220, 100)    # Green (RGB)
+                            label    = f"{sname} v"
                         else:
                             already_names.append(f"{sname} ({sroll})")
-                            color_cv = (0, 180, 255)
+                            color_cv = (0, 180, 255)    # Blue (RGB)
                             label    = f"{sname} (already)"
                     else:
                         unknown_count += 1
-                        color_cv = (0, 0, 220)
+                        color_cv = (220, 0, 0)          # Red (RGB)
                         label    = "Unknown"
 
                     cv2.rectangle(annotated, (left, top), (right, bottom), color_cv, 3)
                     cv2.putText(annotated, label, (left, max(top-8, 10)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_cv, 2)
-                    try:
-                        annotated_display = np.clip(annotated, 0, 255).astype(np.uint8)
-                        annotated_display = cv2.cvtColor(annotated_display, cv2.COLOR_BGR2RGB)
-                        st.image(annotated_display, caption="Attendance Result", use_container_width=True)
-                    except Exception as img_err:
-                        st.image(frame_rgb, caption="Attendance Result (original)", use_container_width=True)
-                        st.warning(f"Annotation display error: {img_err}")
-                
+
+                # annotated already RGB hai — seedha display
+                st.image(annotated.astype(np.uint8), caption="Attendance Result", use_container_width=True)
 
                 if marked_names:
                     st.success(f"✅ Attendance marked for {len(marked_names)} student(s):")
                     for n in marked_names: st.write(f"  • {n}")
                 if already_names:
-                    st.info(f"ℹ️ Already marked today:")
+                    st.info("ℹ️ Already marked today:")
                     for n in already_names: st.write(f"  • {n}")
                 if unknown_count:
                     st.warning(f"⚠️ {unknown_count} unrecognised face(s) in the photo.")
