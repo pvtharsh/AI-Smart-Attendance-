@@ -1,5 +1,8 @@
+libglib2.0-0
 libgl1
-libgl1-mesa-dri
+libglib2.0-dev
+libgtk2.0-dev
 libsm6
-libxrender1
 libxext6
+libxrender-dev
+libgomp1
