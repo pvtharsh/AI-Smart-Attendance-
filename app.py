@@ -3,11 +3,14 @@ import sqlite3
 import pandas as pd
 import plotly.graph_objects as go
 import cv2
+import mediapipe as mp
 import numpy as np
 from datetime import datetime
 import time
 import os
 import pickle
+from PIL import Image
+import io
 
 st.set_page_config(page_title="NeuroAttend", page_icon="🧠", layout="wide", initial_sidebar_state="expanded")
 
@@ -80,18 +83,10 @@ h1,h2,h3{color:#fff;}p,label,span{color:#8b96b3;}
 """, unsafe_allow_html=True)
 
 # ── MEDIAPIPE SETUP ──────────────────────────────────────────────────────────
-try:
-    import mediapipe as mp
-    mp_face_detection = mp.solutions.face_detection
-    mp_face_mesh      = mp.solutions.face_mesh
-    mp_drawing        = mp.solutions.drawing_utils
-    MEDIAPIPE_OK = True
-except Exception as e:
-    MEDIAPIPE_OK = False
-    st.error(f"❌ MediaPipe failed to load: {e}\n\nPlease check your requirements.txt has:\n- mediapipe==0.10.9\n- opencv-python-headless==4.8.1.78\n- protobuf==4.25.3")
-    st.stop()
+mp_face_detection = mp.solutions.face_detection
+mp_face_mesh      = mp.solutions.face_mesh
+mp_drawing        = mp.solutions.drawing_utils
 
-# Eye landmark indices for mediapipe face mesh (left & right eye)
 LEFT_EYE_IDXS  = [362, 385, 387, 263, 373, 380]
 RIGHT_EYE_IDXS = [33,  160, 158, 133, 153, 144]
 
@@ -152,38 +147,51 @@ def _lm_to_vec(face_landmarks, img_w, img_h):
 
 def get_face_encoding_from_frame(frame_bgr):
     h, w = frame_bgr.shape[:2]
-    rgb   = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1,
                                 refine_landmarks=True, min_detection_confidence=0.5) as fm:
         result = fm.process(rgb)
     if not result.multi_face_landmarks:
         return None, None
-    lms  = result.multi_face_landmarks[0]
-    enc  = _lm_to_vec(lms, w, h)
+    lms = result.multi_face_landmarks[0]
+    enc = _lm_to_vec(lms, w, h)
     xs = [lm.x * w for lm in lms.landmark]
     ys = [lm.y * h for lm in lms.landmark]
     bbox = (int(min(ys)), int(max(xs)), int(max(ys)), int(min(xs)))
     return enc, bbox
 
-def compare_encodings(known_encs, candidate_enc, threshold=0.18):
+def compare_encodings(known_encs, candidate_enc, threshold=0.30):
+    """
+    Cosine-distance comparison with safe vector size handling.
+    Returns (best_idx, distance).
+    """
+    if not known_encs:
+        return -1, 1.0
+
+    candidate = np.array(candidate_enc, dtype=np.float32).flatten()
+    # Normalize candidate
+    c_norm = np.linalg.norm(candidate)
+    if c_norm > 0:
+        candidate = candidate / c_norm
+
     dists = []
     for k in known_encs:
         try:
-            # Reshape both to same size if mismatch
             k_arr = np.array(k, dtype=np.float32).flatten()
-            c_arr = np.array(candidate_enc, dtype=np.float32).flatten()
-            min_len = min(len(k_arr), len(c_arr))
+            # Match sizes — truncate to shorter length
+            min_len = min(len(k_arr), len(candidate))
             k_arr = k_arr[:min_len]
-            c_arr = c_arr[:min_len]
-            # Normalize
-            k_arr = k_arr / (np.linalg.norm(k_arr) + 1e-9)
-            c_arr = c_arr / (np.linalg.norm(c_arr) + 1e-9)
-            dist = 1 - float(np.dot(k_arr, c_arr))
+            c_arr = candidate[:min_len]
+            # Re-normalize after truncation
+            kn = np.linalg.norm(k_arr)
+            cn = np.linalg.norm(c_arr)
+            if kn > 0: k_arr = k_arr / kn
+            if cn > 0: c_arr = c_arr / cn
+            dist = 1.0 - float(np.dot(k_arr, c_arr))
             dists.append(dist)
         except Exception:
             dists.append(1.0)
-    if not dists:
-        return -1, 1.0
+
     best_idx = int(np.argmin(dists))
     return best_idx, dists[best_idx]
 
@@ -194,8 +202,10 @@ def load_known_faces():
     known_encs, known_ids, known_names, known_rolls = [], [], [], []
     for sid, name, roll_no, blob in rows:
         enc = np.frombuffer(blob, dtype=np.float32)
-        known_encs.append(enc); known_ids.append(sid)
-        known_names.append(name); known_rolls.append(roll_no)
+        known_encs.append(enc)
+        known_ids.append(sid)
+        known_names.append(name)
+        known_rolls.append(roll_no)
     return known_encs, known_ids, known_names, known_rolls
 
 # ── EAR ──────────────────────────────────────────────────────────────────────
@@ -212,6 +222,16 @@ def calc_ear_from_mesh(face_landmarks, img_w, img_h):
     l_pts = np.array([lm(i) for i in LEFT_EYE_IDXS])
     r_pts = np.array([lm(i) for i in RIGHT_EYE_IDXS])
     return (_ear(l_pts) + _ear(r_pts)) / 2.0
+
+# ── SAFE IMAGE DISPLAY ────────────────────────────────────────────────────────
+def safe_show_image(arr_rgb, caption="", use_container_width=True):
+    """Always convert numpy array to PIL before st.image — avoids all dtype bugs."""
+    try:
+        arr = np.clip(arr_rgb, 0, 255).astype(np.uint8)
+        pil = Image.fromarray(arr)
+        st.image(pil, caption=caption, use_container_width=use_container_width)
+    except Exception as e:
+        st.error(f"Image display error: {e}")
 
 # ── UI HELPERS ────────────────────────────────────────────────────────────────
 def make_cylinder_card(color, icon, value, label, fill_pct):
@@ -232,11 +252,11 @@ def make_cylinder_card(color, icon, value, label, fill_pct):
         <div class="cyl-label cyl-label-{color}">{label}</div>
     </div>""", unsafe_allow_html=True)
 
-COLORS       = ['#00e5ff','#ff2e92','#a855f7','#00e596','#ffaa00','#ff6b6b','#7fffd4']
-COLOR_BG     = ['rgba(0,229,255,.15)','rgba(255,46,146,.15)','rgba(168,85,247,.15)',
-                 'rgba(0,229,150,.15)','rgba(255,170,0,.15)','rgba(255,107,107,.15)']
-COLOR_BORDER = ['rgba(0,229,255,.4)','rgba(255,46,146,.4)','rgba(168,85,247,.4)',
-                 'rgba(0,229,150,.4)','rgba(255,170,0,.4)','rgba(255,107,107,.4)']
+COLORS         = ['#00e5ff','#ff2e92','#a855f7','#00e596','#ffaa00','#ff6b6b','#7fffd4']
+COLOR_BG       = ['rgba(0,229,255,.15)','rgba(255,46,146,.15)','rgba(168,85,247,.15)',
+                   'rgba(0,229,150,.15)','rgba(255,170,0,.15)','rgba(255,107,107,.15)']
+COLOR_BORDER   = ['rgba(0,229,255,.4)','rgba(255,46,146,.4)','rgba(168,85,247,.4)',
+                   'rgba(0,229,150,.4)','rgba(255,170,0,.4)','rgba(255,107,107,.4)']
 GRADIENTS_FROM = ['#00b8cc','#cc1166','#7722cc','#00aa70','#cc8800','#cc3333']
 
 def render_attendance_bar_chart(attendance_df):
@@ -395,7 +415,6 @@ elif page == "⬡  Register Student":
 
     st.markdown('<div class="neon-content-card">', unsafe_allow_html=True)
     st.markdown('<div class="neon-card-heading">⬡ STUDENT DETAILS</div>', unsafe_allow_html=True)
-
     with st.form("register_form"):
         name     = st.text_input("Student Name")
         roll_no  = st.text_input("Roll Number")
@@ -416,20 +435,18 @@ elif page == "⬡  Register Student":
             if img_source is None:
                 st.error("Please upload a photo or take a webcam snapshot!")
             else:
-                import io
-                from PIL import Image
                 pil_img   = Image.open(io.BytesIO(img_source.read())).convert("RGB")
                 frame_rgb = np.array(pil_img)
                 frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
                 enc, bbox = get_face_encoding_from_frame(frame_bgr)
                 if enc is None:
-                    st.error("❌ No face detected in the image! Please try again with a clearer photo.")
+                    st.error("❌ No face detected! Please try with a clearer photo.")
                 else:
                     photo_path = f"student_photos/{roll_no}_{name}.jpg"
                     cv2.imwrite(photo_path, frame_bgr)
                     try:
-                        conn   = get_connection(); cursor = conn.cursor()
+                        conn = get_connection(); cursor = conn.cursor()
                         cursor.execute('INSERT INTO students (name,roll_no,encoding,photo_path) VALUES (?,?,?,?)',
                                        (name, roll_no, enc.tobytes(), photo_path))
                         conn.commit(); conn.close()
@@ -438,19 +455,19 @@ elif page == "⬡  Register Student":
                         if bbox:
                             top, right, bottom, left = bbox
                             cv2.rectangle(preview, (left, top), (right, bottom), (0, 229, 255), 3)
-                        st.image(preview, caption=f"Registered: {name}", width=320)
+                        safe_show_image(preview, caption=f"Registered: {name}", use_container_width=False)
                     except sqlite3.IntegrityError:
                         st.error(f"Roll No {roll_no} is already registered!")
 
 
-# ── MARK ATTENDANCE ───────────────────────────────────────────────────────────
 # ── MARK ATTENDANCE ───────────────────────────────────────────────────────────
 elif page == "⬡  Mark Attendance":
     st.markdown('<div class="neon-tag">⬡ LIVE SESSION</div>', unsafe_allow_html=True)
     st.markdown('<div class="neon-title">Mark Attendance</div>', unsafe_allow_html=True)
     st.markdown('<div class="neon-subtitle">Upload a class photo or use webcam — faces are matched automatically</div>', unsafe_allow_html=True)
 
-    EAR_THRESHOLD = 0.21
+    MATCH_THRESHOLD = 0.30   # ← relaxed threshold (0.18 was too strict)
+
     known_encodings, known_ids, known_names, known_rolls = load_known_faces()
 
     if not known_encodings:
@@ -468,8 +485,6 @@ elif page == "⬡  Mark Attendance":
             cam_img = st.camera_input("Take attendance photo")
             st.markdown('</div>', unsafe_allow_html=True)
             if cam_img:
-                import io
-                from PIL import Image
                 pil_img   = Image.open(io.BytesIO(cam_img.read())).convert("RGB")
                 frame_rgb = np.array(pil_img)
         else:
@@ -477,15 +492,13 @@ elif page == "⬡  Mark Attendance":
             up = st.file_uploader("Upload class photo", type=["jpg","jpeg","png"])
             st.markdown('</div>', unsafe_allow_html=True)
             if up:
-                import io
-                from PIL import Image
                 pil_img   = Image.open(io.BytesIO(up.read())).convert("RGB")
                 frame_rgb = np.array(pil_img)
 
         if frame_rgb is not None:
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            h, w = frame_bgr.shape[:2]
+            h, w = frame_rgb.shape[:2]
 
+            # Detect faces
             with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as fd:
                 res = fd.process(frame_rgb)
 
@@ -493,68 +506,73 @@ elif page == "⬡  Mark Attendance":
             already_names = []
             unknown_count = 0
 
-            # RGB mein seedha copy — no BGR conversion needed
+            # Work entirely in RGB — no BGR conversion needed for display
             annotated = frame_rgb.copy()
 
             if not res.detections:
-                st.warning("No faces detected in the image.")
-                st.image(annotated, caption="No faces found", use_container_width=True)
+                st.warning("⚠️ No faces detected in the image.")
+                safe_show_image(annotated, caption="No faces found")
             else:
-                with mp_face_mesh.FaceMesh(static_image_mode=True,
-                                           max_num_faces=len(res.detections)+2,
-                                           refine_landmarks=True,
-                                           min_detection_confidence=0.4) as fm:
+                with mp_face_mesh.FaceMesh(
+                    static_image_mode=True,
+                    max_num_faces=len(res.detections) + 2,
+                    refine_landmarks=True,
+                    min_detection_confidence=0.4
+                ) as fm:
                     mesh_res = fm.process(frame_rgb)
 
                 mesh_landmarks = mesh_res.multi_face_landmarks if mesh_res.multi_face_landmarks else []
 
                 for lms in mesh_landmarks:
                     enc = _lm_to_vec(lms, w, h)
-                    best_idx, dist = compare_encodings(known_encodings, enc, threshold=0.18)
+                    best_idx, dist = compare_encodings(known_encodings, enc, threshold=MATCH_THRESHOLD)
 
+                    # Bounding box
                     xs = [lm.x * w for lm in lms.landmark]
                     ys = [lm.y * h for lm in lms.landmark]
-                    left, top     = int(min(xs)), int(min(ys))
-                    right, bottom = int(max(xs)), int(max(ys))
-                    pad = 10
-                    left, top     = max(0, left-pad),  max(0, top-pad)
-                    right, bottom = min(w, right+pad), min(h, bottom+pad)
+                    left   = max(0, int(min(xs)) - 10)
+                    top    = max(0, int(min(ys)) - 10)
+                    right  = min(w, int(max(xs)) + 10)
+                    bottom = min(h, int(max(ys)) + 10)
 
-                    if best_idx >= 0 and dist < 0.18:
-                        sid   = known_ids[best_idx]
-                        sname = known_names[best_idx]
-                        sroll = known_rolls[best_idx]
+                    if best_idx >= 0 and dist < MATCH_THRESHOLD:
+                        sid    = known_ids[best_idx]
+                        sname  = known_names[best_idx]
+                        sroll  = known_rolls[best_idx]
                         success = mark_attendance_db(sid)
                         if success:
                             marked_names.append(f"{sname} ({sroll})")
-                            color_cv = (0, 220, 100)    # Green (RGB)
-                            label    = f"{sname} v"
+                            color_rgb = (0, 220, 100)       # Green in RGB
+                            label     = f"{sname} OK"
                         else:
                             already_names.append(f"{sname} ({sroll})")
-                            color_cv = (0, 180, 255)    # Blue (RGB)
-                            label    = f"{sname} (already)"
+                            color_rgb = (0, 180, 255)       # Blue in RGB
+                            label     = f"{sname} (done)"
                     else:
                         unknown_count += 1
-                        color_cv = (220, 0, 0)          # Red (RGB)
-                        label    = "Unknown"
+                        color_rgb = (220, 50, 50)           # Red in RGB
+                        label     = "Unknown"
 
-                    cv2.rectangle(annotated, (left, top), (right, bottom), color_cv, 3)
-                    cv2.putText(annotated, label, (left, max(top-8, 10)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_cv, 2)
+                    # Draw on RGB annotated image directly
+                    cv2.rectangle(annotated, (left, top), (right, bottom), color_rgb, 3)
+                    cv2.putText(annotated, label, (left, max(top - 10, 15)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.75, color_rgb, 2, cv2.LINE_AA)
 
-                # annotated already RGB hai — seedha display
-                st.image(annotated.astype(np.uint8), caption="Attendance Result", use_container_width=True)
+                # ✅ Safe display using PIL wrapper
+                safe_show_image(annotated, caption="Attendance Result")
 
                 if marked_names:
                     st.success(f"✅ Attendance marked for {len(marked_names)} student(s):")
-                    for n in marked_names: st.write(f"  • {n}")
+                    for n in marked_names:
+                        st.write(f"  • {n}")
                 if already_names:
                     st.info("ℹ️ Already marked today:")
-                    for n in already_names: st.write(f"  • {n}")
+                    for n in already_names:
+                        st.write(f"  • {n}")
                 if unknown_count:
                     st.warning(f"⚠️ {unknown_count} unrecognised face(s) in the photo.")
-                if not marked_names and not already_names:
-                    st.error("No registered students found in this photo.")
+                if not marked_names and not already_names and not unknown_count:
+                    st.error("No faces could be processed.")
 
 
 # ── ATTENDANCE RECORDS ────────────────────────────────────────────────────────
