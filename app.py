@@ -225,11 +225,13 @@ def calc_ear_from_mesh(face_landmarks, img_w, img_h):
 
 # ── SAFE IMAGE DISPLAY ────────────────────────────────────────────────────────
 def safe_show_image(arr_rgb, caption="", use_container_width=True):
-    """Always convert numpy array to PIL before st.image — avoids all dtype bugs."""
     try:
         arr = np.clip(arr_rgb, 0, 255).astype(np.uint8)
         pil = Image.fromarray(arr)
-        st.image(pil, caption=caption, use_container_width=use_container_width)
+        try:
+            st.image(pil, caption=caption, use_container_width=use_container_width)
+        except TypeError:
+            st.image(pil, caption=caption, width=700)
     except Exception as e:
         st.error(f"Image display error: {e}")
 
