@@ -269,7 +269,7 @@ def render_attendance_bar_chart(attendance_df):
     total_days = max(attendance_df['date'].nunique(), 1)
     counts['Percentage'] = (counts['Days Present'] / total_days * 100).round(0).astype(int)
     rows_html = ""
-    for i, row in counts.iterrows():
+    for i, (_, row) in enumerate(counts.iterrows()):
         idx = i % len(COLORS)
         initial = row['Student'][0].upper()
         color = COLORS[idx]; bg = COLOR_BG[idx]; border = COLOR_BORDER[idx]
