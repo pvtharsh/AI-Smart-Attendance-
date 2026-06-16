@@ -166,7 +166,22 @@ def get_face_encoding_from_frame(frame_bgr):
     return enc, bbox
 
 def compare_encodings(known_encs, candidate_enc, threshold=0.18):
-    dists = [1 - float(np.dot(k, candidate_enc)) for k in known_encs]
+    dists = []
+    for k in known_encs:
+        try:
+            # Reshape both to same size if mismatch
+            k_arr = np.array(k, dtype=np.float32).flatten()
+            c_arr = np.array(candidate_enc, dtype=np.float32).flatten()
+            min_len = min(len(k_arr), len(c_arr))
+            k_arr = k_arr[:min_len]
+            c_arr = c_arr[:min_len]
+            # Normalize
+            k_arr = k_arr / (np.linalg.norm(k_arr) + 1e-9)
+            c_arr = c_arr / (np.linalg.norm(c_arr) + 1e-9)
+            dist = 1 - float(np.dot(k_arr, c_arr))
+            dists.append(dist)
+        except Exception:
+            dists.append(1.0)
     if not dists:
         return -1, 1.0
     best_idx = int(np.argmin(dists))
