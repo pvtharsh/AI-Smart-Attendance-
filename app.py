@@ -537,6 +537,7 @@ elif page == "⬡  Mark Attendance":
                     cv2.putText(annotated, label, (left, max(top-8, 10)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_cv, 2)
 
+                annotated = np.clip(annotated, 0, 255).astype(np.uint8)
                 st.image(annotated, caption="Attendance Result", use_container_width=True)
 
                 if marked_names:
