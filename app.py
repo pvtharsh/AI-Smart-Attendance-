@@ -536,9 +536,15 @@ elif page == "⬡  Mark Attendance":
                     cv2.rectangle(annotated, (left, top), (right, bottom), color_cv, 3)
                     cv2.putText(annotated, label, (left, max(top-8, 10)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_cv, 2)
-
-                annotated = cv2.cvtColor(np.clip(annotated, 0, 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
-                st.image(annotated, caption="Attendance Result", use_container_width=True)
+                    try:
+    annotated_display = np.clip(annotated, 0, 255).astype(np.uint8)
+    annotated_display = cv2.cvtColor(annotated_display, cv2.COLOR_BGR2RGB)
+    st.image(annotated_display, caption="Attendance Result", use_container_width=True)
+except Exception as img_err:
+    # Fallback: show original frame if annotation fails
+    st.image(frame_rgb, caption="Attendance Result (original)", use_container_width=True)
+    st.warning(f"Annotation display error: {img_err}")
+                
 
                 if marked_names:
                     st.success(f"✅ Attendance marked for {len(marked_names)} student(s):")
