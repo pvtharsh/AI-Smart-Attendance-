@@ -3,7 +3,6 @@ import sqlite3
 import pandas as pd
 import plotly.graph_objects as go
 import cv2
-import mediapipe as mp
 import numpy as np
 from datetime import datetime
 import time
@@ -81,9 +80,16 @@ h1,h2,h3{color:#fff;}p,label,span{color:#8b96b3;}
 """, unsafe_allow_html=True)
 
 # ── MEDIAPIPE SETUP ──────────────────────────────────────────────────────────
-mp_face_detection = mp.solutions.face_detection
-mp_face_mesh      = mp.solutions.face_mesh
-mp_drawing        = mp.solutions.drawing_utils
+try:
+    import mediapipe as mp
+    mp_face_detection = mp.solutions.face_detection
+    mp_face_mesh      = mp.solutions.face_mesh
+    mp_drawing        = mp.solutions.drawing_utils
+    MEDIAPIPE_OK = True
+except Exception as e:
+    MEDIAPIPE_OK = False
+    st.error(f"❌ MediaPipe failed to load: {e}\n\nPlease check your requirements.txt has:\n- mediapipe==0.10.9\n- opencv-python-headless==4.8.1.78\n- protobuf==4.25.3")
+    st.stop()
 
 # Eye landmark indices for mediapipe face mesh (left & right eye)
 LEFT_EYE_IDXS  = [362, 385, 387, 263, 373, 380]
@@ -136,19 +142,15 @@ def mark_attendance_db(student_id):
                    (student_id, today, now_time, 'Present'))
     conn.commit(); conn.close(); return True
 
-# ── FACE EMBEDDING HELPERS (mediapipe mesh → 128-d landmark vector) ──────────
+# ── FACE EMBEDDING HELPERS ───────────────────────────────────────────────────
 def _lm_to_vec(face_landmarks, img_w, img_h):
-    """Flatten all 468 normalised landmarks to a 1404-d float32 vector,
-    then L2-normalise — used as a lightweight face descriptor."""
     pts = np.array([[lm.x, lm.y, lm.z] for lm in face_landmarks.landmark], dtype=np.float32)
-    # Align: subtract nose-tip (landmark 1) so position-invariant
     pts -= pts[1]
     vec = pts.flatten()
     norm = np.linalg.norm(vec)
     return vec / norm if norm > 0 else vec
 
 def get_face_encoding_from_frame(frame_bgr):
-    """Return (encoding_vector, face_bbox) or (None, None) if no single face found."""
     h, w = frame_bgr.shape[:2]
     rgb   = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1,
@@ -158,14 +160,12 @@ def get_face_encoding_from_frame(frame_bgr):
         return None, None
     lms  = result.multi_face_landmarks[0]
     enc  = _lm_to_vec(lms, w, h)
-    # Bounding box from landmark extremes
     xs = [lm.x * w for lm in lms.landmark]
     ys = [lm.y * h for lm in lms.landmark]
-    bbox = (int(min(ys)), int(max(xs)), int(max(ys)), int(min(xs)))  # top,right,bottom,left
+    bbox = (int(min(ys)), int(max(xs)), int(max(ys)), int(min(xs)))
     return enc, bbox
 
 def compare_encodings(known_encs, candidate_enc, threshold=0.18):
-    """Cosine-distance based comparison. Returns (best_idx, distance)."""
     dists = [1 - float(np.dot(k, candidate_enc)) for k in known_encs]
     if not dists:
         return -1, 1.0
@@ -183,7 +183,7 @@ def load_known_faces():
         known_names.append(name); known_rolls.append(roll_no)
     return known_encs, known_ids, known_names, known_rolls
 
-# ── EAR (Eye Aspect Ratio) ────────────────────────────────────────────────────
+# ── EAR ──────────────────────────────────────────────────────────────────────
 def _ear(pts):
     A = np.linalg.norm(pts[1] - pts[5])
     B = np.linalg.norm(pts[2] - pts[4])
@@ -388,7 +388,6 @@ elif page == "⬡  Register Student":
         submit   = st.form_submit_button("◉  REGISTER STUDENT")
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── WEBCAM fallback ──
     st.markdown('<div class="neon-content-card">', unsafe_allow_html=True)
     st.markdown('<div class="neon-card-heading">⬡ OR USE WEBCAM SNAPSHOT</div>', unsafe_allow_html=True)
     cam_img = st.camera_input("Take a photo")
@@ -420,7 +419,6 @@ elif page == "⬡  Register Student":
                                        (name, roll_no, enc.tobytes(), photo_path))
                         conn.commit(); conn.close()
                         st.success(f"✅ {name} (Roll No: {roll_no}) registered successfully!")
-                        # Draw box on preview
                         preview = frame_rgb.copy()
                         if bbox:
                             top, right, bottom, left = bbox
@@ -473,7 +471,6 @@ elif page == "⬡  Mark Attendance":
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             h, w = frame_bgr.shape[:2]
 
-            # Detect all faces in image using face_detection
             with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as fd:
                 res = fd.process(frame_rgb)
 
@@ -495,7 +492,6 @@ elif page == "⬡  Mark Attendance":
                     enc = _lm_to_vec(lms, w, h)
                     best_idx, dist = compare_encodings(known_encodings, enc, threshold=0.18)
 
-                    # Bounding box
                     xs = [lm.x * w for lm in lms.landmark]
                     ys = [lm.y * h for lm in lms.landmark]
                     left, top     = int(min(xs)), int(min(ys))
