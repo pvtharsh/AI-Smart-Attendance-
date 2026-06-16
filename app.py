@@ -492,7 +492,7 @@ elif page == "⬡  Mark Attendance":
             marked_names  = []
             already_names = []
             unknown_count = 0
-            annotated     = frame_rgb.copy()
+            annotated     = cv2.cvtColor(frame_rgb.copy(), cv2.COLOR_RGB2BGR)
 
             if not res.detections:
                 st.warning("No faces detected in the image.")
@@ -537,7 +537,7 @@ elif page == "⬡  Mark Attendance":
                     cv2.putText(annotated, label, (left, max(top-8, 10)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_cv, 2)
 
-                annotated = np.clip(annotated, 0, 255).astype(np.uint8)
+                annotated = cv2.cvtColor(np.clip(annotated, 0, 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
                 st.image(annotated, caption="Attendance Result", use_container_width=True)
 
                 if marked_names:
